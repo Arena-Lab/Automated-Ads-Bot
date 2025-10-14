@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+*.session
+sessions/
+.cache/
+.idea/
+.vscode/
+*.log
+node_modules/
+static/

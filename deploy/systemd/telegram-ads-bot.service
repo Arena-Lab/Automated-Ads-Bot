@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram Ads Bot (aiogram)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=%i
+WorkingDirectory=/home/%i/Automatic Ads
+Environment=PYTHONUNBUFFERED=1
+Environment=ENV_FILE=/home/%i/Automatic Ads/.env
+ExecStart=/home/%i/.venv/bin/python -m app.bot.main
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
