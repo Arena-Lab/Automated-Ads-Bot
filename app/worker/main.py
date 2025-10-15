@@ -25,6 +25,24 @@ class SkipChat(Exception):
     pass
 
 
+def _type_name(t) -> str:
+    try:
+        return str(t).split('.')[-1].lower()
+    except Exception:
+        return (str(t) if t is not None else "").lower()
+
+
+def _to_bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    if isinstance(v, str):
+        s = v.strip().lower()
+        return s in {"1", "true", "on", "yes", "y"}
+    return bool(v)
+
+
 class WorkerSettings:
     # Parse REDIS_URL and configure SSL explicitly (works for Redis Cloud)
     _u = urlparse(settings.REDIS_URL)
@@ -79,7 +97,7 @@ async def _warm_up_dialogs(client: Client, max_load: int = 500) -> int:
     return loaded
 
 
-async def _send_via_account(client: Client, msg: Dict[str, Any], chat_id: int) -> None:
+async def _send_via_account(client: Client, msg: Dict[str, Any], chat_id: int, allowed_types: Set[str] | None = None) -> None:
     # Ensure connection and resolve peer robustly
     logger.info(f"Attempting to send to {chat_id}, client connected: {client.is_connected}")
     if not client.is_connected:
@@ -105,12 +123,18 @@ async def _send_via_account(client: Client, msg: Dict[str, Any], chat_id: int) -
         candidates = [chat_id]
 
     resolved = None
+    resolved_type = None
     for _pass in (1, 2):
         for pid in candidates:
             try:
                 info = await client.get_chat(pid)
-                logger.info(f"Resolved peer {pid}: {info.type} - {getattr(info, 'title', 'Unknown')}")
+                tname = _type_name(info.type)
+                logger.info(f"Resolved peer {pid}: {tname} - {getattr(info, 'title', 'Unknown')}")
+                # Respect allowed chat-types if provided
+                if allowed_types is not None and tname not in allowed_types:
+                    raise SkipChat(f"type_disabled:{tname}")
                 resolved = pid
+                resolved_type = tname
                 break
             except Exception as e:
                 logger.debug(f"Peer resolve failed with {pid}: {e}")
@@ -168,12 +192,16 @@ async def send_campaign(ctx, campaign_id: str):
     if not campaign:
         logger.warning("Campaign not found: %s", campaign_id)
         return {"ok": False, "error": "not_found"}
+    cid_str = str(oid)
     owner = campaign["owner_user_id"]
     targets: List[int] = campaign.get("targets", [])
     msg = campaign.get("message", {})
     rate_per_min = int(campaign.get("rate_per_min", settings.INTERVAL_PRESETS_DEFAULT))
     delay = max(60 / max(rate_per_min, 1), 1.0)
     mode = campaign.get("mode", "include")
+    # Allowed chat types from campaign (default: all enabled)
+    types_cfg = campaign.get("types") or {"private": True, "group": True, "supergroup": True, "channel": True}
+    allowed_types: Set[str] = {k for k, v in types_cfg.items() if _to_bool(v)}
     exclude: Set[int] = set(campaign.get("exclude", []) or [])
 
     # Prepare clients for all owner's accounts
@@ -213,10 +241,10 @@ async def send_campaign(ctx, campaign_id: str):
                 logger.error(f"Connection test failed for {acc.get('phone', 'unknown')}: {test_error}")
                 await c.disconnect()
                 continue
-            await logs.insert_one({"owner_user_id": owner, "ts": datetime.now(timezone.utc), "event": "client_connect", "phone": acc.get('phone', 'unknown')})
+            await logs.insert_one({"owner_user_id": owner, "campaign_id": cid_str, "ts": datetime.now(timezone.utc), "event": "client_connect", "phone": acc.get('phone', 'unknown')})
         except Exception as e:
             logger.error(f"Failed to connect account {acc.get('phone', 'unknown')}: {e}")
-            await logs.insert_one({"owner_user_id": owner, "ts": datetime.now(timezone.utc), "event": "client_connect_fail", "error": str(e), "phone": acc.get('phone', 'unknown')})
+            await logs.insert_one({"owner_user_id": owner, "campaign_id": cid_str, "ts": datetime.now(timezone.utc), "event": "client_connect_fail", "error": str(e), "phone": acc.get('phone', 'unknown')})
 
     logger.info(f"User {owner}: Found {account_count} accounts in DB, {len(clients)} connected successfully")
     
@@ -228,8 +256,12 @@ async def send_campaign(ctx, campaign_id: str):
         async for dialog in client.get_dialogs():
             try:
                 cid = int(dialog.chat.id)
-                if cid not in exclude:
-                    ids.append(cid)
+                tname = _type_name(dialog.chat.type)
+                if cid in exclude:
+                    continue
+                if allowed_types and tname not in allowed_types:
+                    continue
+                ids.append(cid)
             except Exception:
                 continue
         return ids
@@ -242,10 +274,34 @@ async def send_campaign(ctx, campaign_id: str):
                 logger.info(f"Discovered {len(targets)} dialogs for user {owner}")
             except Exception as e:
                 logger.error(f"Failed to discover dialogs for user {owner}: {e}")
-                await logs.insert_one({"owner_user_id": owner, "ts": datetime.now(timezone.utc), "event": "discover_fail", "error": str(e)})
+                await logs.insert_one({"owner_user_id": owner, "campaign_id": cid_str, "ts": datetime.now(timezone.utc), "event": "discover_fail", "error": str(e)})
                 targets = []
     
     logger.info(f"Campaign {campaign_id}: mode={mode}, targets={len(targets)}, exclude={len(exclude)}, message_keys={list(msg.keys()) if msg else 'None'}")
+
+    def classify_fail_reason(exc: Exception) -> str:
+        s = f"{type(exc).__name__}: {exc}".upper()
+        if "PEER_FLOOD" in s:
+            return "limit"
+        if "FLOOD_WAIT" in s or "FLOODWAIT" in s:
+            return "floodwait"
+        if "BOT" in s and "START" in s:
+            return "requires_start"
+        if "FORBIDDEN" in s and "SEND_MESSAGE" in s:
+            return "forbidden/not_allowed"
+        if "FORBIDDEN" in s or "BLOCK" in s:
+            return "forbidden/blocked"
+        if "USER_NOT_PARTICIPANT" in s or "CHANNEL_PRIVATE" in s or "INVITE" in s:
+            return "forbidden/not_member"
+        if "MUTE" in s or "RESTRICT" in s:
+            return "muted/restricted"
+        if "INPUT_USER_DEACTIVATED" in s:
+            return "user/deactivated"
+        if "PEER_ID_INVALID" in s or "PARTICIPANT_ID_INVALID" in s:
+            return "peer/invalid"
+        if "SLOWMODE" in s:
+            return "rate/slowmode"
+        return "unknown"
 
     async def worker_loop(client: Client, subset: List[int]):
         logger.info(f"Worker loop starting with {len(subset)} targets")
@@ -276,25 +332,40 @@ async def send_campaign(ctx, campaign_id: str):
                 logger.info(f"Campaign stopped, breaking loop")
                 break
             try:
+                # Attempt log with metadata
+                chat_title = None
+                chat_type = None
+                try:
+                    info = await client.get_chat(chat_id)
+                    chat_type = _type_name(getattr(info, 'type', None))
+                    chat_title = getattr(info, 'title', None)
+                except Exception:
+                    pass
+                if allowed_types and chat_type and chat_type not in allowed_types:
+                    await logs.insert_one({"owner_user_id": owner, "campaign_id": cid_str, "ts": datetime.now(timezone.utc), "event": "skipped", "chat_id": chat_id, "reason": f"type_disabled:{chat_type}"})
+                    continue
+                await logs.insert_one({"owner_user_id": owner, "campaign_id": cid_str, "ts": datetime.now(timezone.utc), "event": "attempt", "chat_id": chat_id, "chat_type": chat_type, "chat_title": chat_title})
+
                 logger.info(f"Sending message to {chat_id}")
-                await _send_via_account(client, msg, chat_id)
+                await _send_via_account(client, msg, chat_id, allowed_types)
                 logger.info(f"Successfully sent to {chat_id}")
-                await logs.insert_one({"owner_user_id": owner, "ts": datetime.now(timezone.utc), "event": "sent", "chat_id": chat_id})
+                await logs.insert_one({"owner_user_id": owner, "campaign_id": cid_str, "ts": datetime.now(timezone.utc), "event": "sent", "chat_id": chat_id, "chat_type": chat_type, "chat_title": chat_title})
             except FloodWait as fw:
-                await logs.insert_one({"owner_user_id": owner, "ts": datetime.now(timezone.utc), "event": "floodwait", "chat_id": chat_id, "seconds": fw.value})
+                await logs.insert_one({"owner_user_id": owner, "campaign_id": cid_str, "ts": datetime.now(timezone.utc), "event": "floodwait", "chat_id": chat_id, "seconds": fw.value})
                 await asyncio.sleep(fw.value + 1)
                 # retry once
                 try:
-                    await _send_via_account(client, msg, chat_id)
-                    await logs.insert_one({"owner_user_id": owner, "ts": datetime.now(timezone.utc), "event": "sent_after_fw", "chat_id": chat_id})
+                    await _send_via_account(client, msg, chat_id, allowed_types)
+                    await logs.insert_one({"owner_user_id": owner, "campaign_id": cid_str, "ts": datetime.now(timezone.utc), "event": "sent_after_fw", "chat_id": chat_id})
                 except Exception as e:
-                    await logs.insert_one({"owner_user_id": owner, "ts": datetime.now(timezone.utc), "event": "failed", "chat_id": chat_id, "error": str(e)})
+                    await logs.insert_one({"owner_user_id": owner, "campaign_id": cid_str, "ts": datetime.now(timezone.utc), "event": "failed", "chat_id": chat_id, "error": str(e), "fail_reason": classify_fail_reason(e)})
             except SkipChat as s:
-                logger.info(f"Skipped {chat_id}: {s}")
-                await logs.insert_one({"owner_user_id": owner, "ts": datetime.now(timezone.utc), "event": "skipped", "chat_id": chat_id, "reason": "unresolved_peer"})
+                reason = str(s)
+                logger.info(f"Skipped {chat_id}: {reason}")
+                await logs.insert_one({"owner_user_id": owner, "campaign_id": cid_str, "ts": datetime.now(timezone.utc), "event": "skipped", "chat_id": chat_id, "reason": reason, "chat_type": chat_type, "chat_title": chat_title})
             except Exception as e:
                 logger.error(f"Failed to send to {chat_id}: {type(e).__name__}: {e}")
-                await logs.insert_one({"owner_user_id": owner, "ts": datetime.now(timezone.utc), "event": "failed", "chat_id": chat_id, "error": f"{type(e).__name__}: {str(e)}"})
+                await logs.insert_one({"owner_user_id": owner, "campaign_id": cid_str, "ts": datetime.now(timezone.utc), "event": "failed", "chat_id": chat_id, "error": f"{type(e).__name__}: {str(e)}", "chat_type": chat_type, "chat_title": chat_title, "fail_reason": classify_fail_reason(e)})
             await asyncio.sleep(delay)
 
     # Apply exclude to targets if provided
@@ -339,3 +410,4 @@ class Settings(WorkerSettings):
     functions = [dispatch_ad, send_campaign]
     on_startup = startup
     on_shutdown = shutdown
+    job_timeout = 3600

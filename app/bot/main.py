@@ -15,7 +15,7 @@ from app.core.session_manager import session_manager
 from app.core.telegram_login import telegram_login_manager
 from .keyboards import (
     main_menu_kb, back_to_menu_kb, targets_menu_kb, interval_menu_kb,
-    login_menu_kb, accounts_menu_kb, account_detail_kb
+    login_menu_kb, accounts_menu_kb, account_detail_kb, analytics_kb
 )
 from arq import create_pool
 from arq.connections import RedisSettings
@@ -44,6 +44,16 @@ async def get_presets() -> dict:
 
 logger = logging.getLogger(__name__)
 arq_pool = None  # will be initialized on startup
+
+def _to_bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    if isinstance(v, str):
+        s = v.strip().lower()
+        return s in {"1", "true", "on", "yes", "y"}
+    return bool(v)
 
 
 async def safe_answer_callback(cb: CallbackQuery, text: str = None, show_alert: bool = False):
@@ -327,13 +337,43 @@ async def menu_targets(cb: CallbackQuery):
         "Select targeting mode or configure include/exclude IDs.\n\n"
         "• Only These IDs: send only to provided chat IDs\n"
         "• All Dialogs: send to all dialogs of your accounts\n"
-        "• Exclude IDs: skip specific IDs even in All mode"
+        "• Exclude IDs: skip specific IDs even in All mode\n\n"
+        "Toggle where to send: Personal / Groups / Supergroups / Channels"
     )
+    db = get_db_sync()
+    user = await db.users.find_one({"user_id": cb.from_user.id})
+    targets_cfg = (user or {}).get("config", {}).get("targets", {})
+    _defaults = {"private": True, "group": True, "supergroup": True, "channel": True}
+    _raw = targets_cfg.get("types") or {}
+    types = {**_defaults, **{k: _to_bool(v) for k, v in _raw.items()}}
+    await db.users.update_one({"user_id": cb.from_user.id}, {"$set": {"config.targets.types": types}}, upsert=True)
     if cb.message.photo:
-        await cb.message.edit_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=targets_menu_kb())
+        await cb.message.edit_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=targets_menu_kb(types))
     else:
-        await cb.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=targets_menu_kb())
+        await cb.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=targets_menu_kb(types))
     await safe_answer_callback(cb)
+
+
+async def targets_type_toggle(cb: CallbackQuery):
+    """Toggle enabled chat types for targeting and refresh the menu."""
+    _, _, chat_type = cb.data.split(":", 2)
+    db = get_db_sync()
+    user = await db.users.find_one({"user_id": cb.from_user.id})
+    cfg = (user or {}).get("config", {})
+    targets_cfg = cfg.get("targets", {})
+    _defaults = {"private": True, "group": True, "supergroup": True, "channel": True}
+    _raw = targets_cfg.get("types") or {}
+    types = {**_defaults, **{k: bool(v) for k, v in _raw.items()}}
+    current = bool(types.get(chat_type, True))
+    types[chat_type] = not current
+    # Persist the entire merged dict so reads are consistent everywhere
+    await db.users.update_one(
+        {"user_id": cb.from_user.id},
+        {"$set": {"config.targets.types": types}},
+        upsert=True,
+    )
+    # Re-open the targets menu to reflect the new toggles
+    await menu_targets(cb)
 
 
 async def menu_start(cb: CallbackQuery):
@@ -384,6 +424,11 @@ async def menu_start(cb: CallbackQuery):
         include_ids = targets_cfg.get("include", [])
         if not include_ids:
             validation_errors.append("❌ No target IDs set! Use 'Targets' → 'Send All Chats' or add specific IDs.")
+    _defaults_types = {"private": True, "group": True, "supergroup": True, "channel": True}
+    _raw_types = targets_cfg.get("types") or {}
+    types_cfg_val = {**_defaults_types, **{k: _to_bool(v) for k, v in _raw_types.items()}}
+    if not any(types_cfg_val.values()):
+        validation_errors.append("❌ All chat types are disabled! Enable at least one in 'Targets'.")
     
     # 3. Check accounts
     account_count = await session_manager.get_account_count(cb.from_user.id)
@@ -400,6 +445,7 @@ async def menu_start(cb: CallbackQuery):
     mode = targets_cfg.get("mode", "include")
     include = targets_cfg.get("include", [])
     exclude = targets_cfg.get("exclude", [])
+    types_cfg = {**_defaults_types, **{k: _to_bool(v) for k, v in _raw_types.items()}}
     campaign = {
         "owner_user_id": cb.from_user.id,
         "message": message_payload,
@@ -407,6 +453,7 @@ async def menu_start(cb: CallbackQuery):
         "exclude": exclude,
         "mode": mode,
         "rate_per_min": rate,
+        "types": types_cfg,
         "status": "running",
         "created_at": datetime.now(timezone.utc),
     }
@@ -423,6 +470,11 @@ async def menu_start(cb: CallbackQuery):
         await db.users.update_one({"user_id": cb.from_user.id}, {"$unset": {"active_campaign_id": 1}})
         return
     
+    # clear old analytics
+    try:
+        await db.logs.delete_many({"owner_user_id": cb.from_user.id})
+    except Exception:
+        pass
     # enqueue worker
     try:
         await arq_pool.enqueue_job("send_campaign", cid)
@@ -430,15 +482,35 @@ async def menu_start(cb: CallbackQuery):
         await safe_answer_callback(cb, f"Queue error: {e}", show_alert=True)
         return
     
-    # Show success message and update the main menu to show Stop button
     await safe_answer_callback(cb, "✅ Ads Started Successfully! Campaign is now running.", show_alert=True)
     
-    # Update the main menu to show current status
+    types_line = (
+        f"Personal: {'ON' if types_cfg.get('private', True) else 'OFF'} | "
+        f"Groups: {'ON' if types_cfg.get('group', True) else 'OFF'} | "
+        f"Supergroups: {'ON' if types_cfg.get('supergroup', True) else 'OFF'} | "
+        f"Channels: {'ON' if types_cfg.get('channel', True) else 'OFF'}"
+    )
+    include_count = len(include) if mode == "include" else 0
+    exclude_count = len(exclude)
+    sample_ids = ", ".join(str(x) for x in include[:5]) if mode == "include" and include else "-"
+    msg_text = (message_payload or {}).get("text", "")
+    msg_preview = (msg_text[:120] + ("..." if len(msg_text) > 120 else "")) if msg_text else "(no text)"
+    media_info = (message_payload or {}).get("media")
+    media_line = media_info.get("type") if media_info else "None"
+    buttons_count = len((message_payload or {}).get("buttons", []))
     updated_text = (
         f"<b>{settings.BOT_DISPLAY_NAME}</b>\n"
         f"🎯 <b>CAMPAIGN RUNNING</b> 🎯\n\n"
-        f"📊 Messages are being sent automatically\n"
-        f"⚡ Rate: {rate} messages/min per account\n\n"
+        f"⚡ <b>Rate:</b> {rate}/min per account\n"
+        f"👥 <b>Accounts:</b> {account_count}\n"
+        f"🆔 <b>Campaign ID:</b> {cid}\n\n"
+        f"📌 <b>Targets Mode:</b> {mode.upper()}\n"
+        f"🔖 <b>Types:</b> {types_line}\n"
+        f"📇 <b>Include:</b> {include_count if mode == 'include' else 'All Dialogs'}\n"
+        f"🚫 <b>Exclude:</b> {exclude_count} IDs\n"
+        f"🧾 <b>Sample IDs:</b> {sample_ids}\n\n"
+        f"📝 <b>Message:</b> {msg_preview}\n"
+        f"🖼️ <b>Media:</b> {media_line} | 🔘 <b>Buttons:</b> {buttons_count}\n\n"
         f"Use 'Stop Campaign' to stop or 'Analytics' to monitor."
     )
     
@@ -488,18 +560,126 @@ async def menu_stop(cb: CallbackQuery):
 async def menu_analytics(cb: CallbackQuery):
     db = get_db_sync()
     owner = cb.from_user.id
+    user = await db.users.find_one({"user_id": owner})
+    cid = (user or {}).get("active_campaign_id")
     logs = db.logs
-    sent = await logs.count_documents({"owner_user_id": owner, "event": {"$in": ["sent", "sent_after_fw"]}})
-    failed = await logs.count_documents({"owner_user_id": owner, "event": "failed"})
-    fw = await logs.count_documents({"owner_user_id": owner, "event": "floodwait"})
+    match = {"owner_user_id": owner}
+    if cid:
+        match["campaign_id"] = cid
+    sent = await logs.count_documents({**match, "event": {"$in": ["sent", "sent_after_fw"]}})
+    attempts = await logs.count_documents({**match, "event": "attempt"})
+    failed = await logs.count_documents({**match, "event": "failed"})
+    fw = await logs.count_documents({**match, "event": "floodwait"})
+    skipped = await logs.count_documents({**match, "event": "skipped"})
+    reached_ids = await logs.distinct("chat_id", {**match, "event": {"$in": ["sent", "sent_after_fw"]}})
+    reached = len(reached_ids)
+    fail_top = []
+    async for row in logs.aggregate([
+        {"$match": {**match, "event": "failed"}},
+        {"$group": {"_id": {"$ifNull": ["$fail_reason", "unknown"]}, "n": {"$sum": 1}}},
+        {"$sort": {"n": -1}},
+        {"$limit": 5},
+    ]):
+        fail_top.append((row.get("_id") or "unknown", row.get("n", 0)))
+    skip_top = []
+    async for row in logs.aggregate([
+        {"$match": {**match, "event": "skipped"}},
+        {"$group": {"_id": {"$ifNull": ["$reason", "unknown"]}, "n": {"$sum": 1}}},
+        {"$sort": {"n": -1}},
+        {"$limit": 5},
+    ]):
+        skip_top.append((row.get("_id") or "unknown", row.get("n", 0)))
+    fails = "\n".join([f"• {k}: {v}" for k, v in fail_top]) or "• none"
+    skips = "\n".join([f"• {k}: {v}" for k, v in skip_top]) or "• none"
+    header = f"<b>📊 Analytics</b>\n"
+    if cid:
+        header += f"ID: <code>{cid}</code>\n\n"
     text = (
-        "<b>Analytics</b>\n"
-        f"Sent: {sent}\nFailed: {failed}\nFloodWaits: {fw}"
+        header +
+        f"🛰️ Attempts: <b>{attempts}</b>\n"
+        f"✅ Sent: <b>{sent}</b>   ⏭️ Skipped: <b>{skipped}</b>   ❌ Failed: <b>{failed}</b>\n"
+        f"🚦 FloodWaits: <b>{fw}</b>\n"
+        f"📬 Unique Chats Reached: <b>{reached}</b>\n\n"
+        f"<b>Top Failed Reasons</b>\n{fails}\n\n"
+        f"<b>Top Skipped Reasons</b>\n{skips}"
     )
     try:
-        await cb.message.edit_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=back_to_menu_kb())
+        if getattr(cb.message, "photo", None):
+            try:
+                await cb.message.edit_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=analytics_kb())
+            except TelegramBadRequest as e:
+                se = str(e)
+                if "there is no caption" in se or "message is not modified" in se:
+                    try:
+                        await cb.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=analytics_kb())
+                    except TelegramBadRequest as e2:
+                        if "message is not modified" not in str(e2):
+                            raise
+                else:
+                    raise
+        else:
+            try:
+                await cb.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=analytics_kb())
+            except TelegramBadRequest as e:
+                if "message is not modified" not in str(e):
+                    raise
+    finally:
+        await safe_answer_callback(cb)
+
+
+async def analytics_refresh(cb: CallbackQuery):
+    await menu_analytics(cb)
+
+
+async def analytics_targets(cb: CallbackQuery):
+    db = get_db_sync()
+    owner = cb.from_user.id
+    user = await db.users.find_one({"user_id": owner})
+    cfg = (user or {}).get("config", {})
+    targets_cfg = cfg.get("targets", {})
+    _defaults_types = {"private": True, "group": True, "supergroup": True, "channel": True}
+    _raw_types = targets_cfg.get("types") or {}
+    types_cfg = {**_defaults_types, **{k: _to_bool(v) for k, v in _raw_types.items()}}
+    mode = targets_cfg.get("mode", "include")
+    include = targets_cfg.get("include", [])
+    exclude = targets_cfg.get("exclude", [])
+    cid = (user or {}).get("active_campaign_id")
+    logs = db.logs
+    match = {"owner_user_id": owner}
+    if cid:
+        match["campaign_id"] = cid
+    type_counts = {}
+    async for row in logs.aggregate([
+        {"$match": {**match, "event": {"$in": ["attempt", "sent", "sent_after_fw"]}}},
+        {"$group": {"_id": {"$ifNull": ["$chat_type", "unknown"]}, "n": {"$sum": 1}}},
+        {"$sort": {"n": -1}}
+    ]):
+        type_counts[row.get("_id") or "unknown"] = row.get("n", 0)
+    types_line = (
+        f"Personal: {'ON' if types_cfg.get('private') else 'OFF'} | "
+        f"Groups: {'ON' if types_cfg.get('group') else 'OFF'} | "
+        f"Supergroups: {'ON' if types_cfg.get('supergroup') else 'OFF'} | "
+        f"Channels: {'ON' if types_cfg.get('channel') else 'OFF'}"
+    )
+    attempts_sample = []
+    async for ev in logs.find({**match, "event": {"$in": ["attempt", "sent", "sent_after_fw"]}}).sort("ts", -1).limit(10):
+        t = ev.get("chat_type", "?")
+        title = ev.get("chat_title", "?")
+        attempts_sample.append(f"• {t} | {title} | <code>{ev.get('chat_id')}</code>")
+    sample_block = "\n".join(attempts_sample) or "• none yet"
+    text = (
+        f"<b>🎯 Targets</b>\n"
+        f"Mode: <b>{mode.upper()}</b>\n"
+        f"Types: {types_line}\n"
+        f"Include: <b>{len(include) if mode=='include' else 'All Dialogs'}</b> | Exclude: <b>{len(exclude)}</b>\n\n"
+        f"<b>By Type (from activity)</b>\n" +
+        ("\n".join([f"• {k}: {v}" for k, v in type_counts.items()]) if type_counts else "• none yet") +
+        f"\n\n<b>Recent Targets</b>\n{sample_block}"
+    )
+    try:
+        await cb.message.edit_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=analytics_kb())
     except Exception:
-        await cb.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=back_to_menu_kb())
+        await cb.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=analytics_kb())
     await safe_answer_callback(cb)
 
 
@@ -961,15 +1141,7 @@ async def content_message_handler(message: Message):
         else:
             error_msg = result["message"]
             if result.get("error") == "flood_wait":
-                wait_min = result["wait_time"] // 60
-                wait_sec = result["wait_time"] % 60
-                await message.reply(
-                    f"<b>⏳ Rate Limited</b>\n\n"
-                    f"⚠️ <i>Too many login attempts detected</i>\n\n"
-                    f"⏰ <b>Wait Time:</b> {wait_min}m {wait_sec}s\n\n"
-                    f"🔒 <i>This is a Telegram security measure</i>",
-                    parse_mode=ParseMode.HTML
-                )
+                pass
             elif result.get("error") == "invalid_phone":
                 await message.reply(
                     "<b>❌ Invalid Phone Number</b>\n\n"
@@ -1147,12 +1319,15 @@ async def main():
     dp.callback_query.register(targets_include, F.data == "targets:include")
     dp.callback_query.register(targets_all, F.data == "targets:all")
     dp.callback_query.register(targets_exclude, F.data == "targets:exclude")
+    dp.callback_query.register(targets_type_toggle, F.data.startswith("targets:type:"))
     dp.callback_query.register(menu_interval, F.data == "menu:interval")
     dp.callback_query.register(interval_preset, F.data.in_({"interval:safe", "interval:default", "interval:aggressive"}))
     dp.callback_query.register(interval_custom, F.data == "interval:custom")
     dp.callback_query.register(menu_start, F.data == "menu:start")
     dp.callback_query.register(menu_stop, F.data == "menu:stop")
     dp.callback_query.register(menu_analytics, F.data == "menu:analytics")
+    dp.callback_query.register(analytics_refresh, F.data == "analytics:refresh")
+    dp.callback_query.register(analytics_targets, F.data == "analytics:targets")
     dp.callback_query.register(menu_autoreply, F.data == "menu:autoreply")
     dp.callback_query.register(menu_policy, F.data == "menu:policy")
 
@@ -1471,6 +1646,9 @@ async def admin_campaign(message: Message):
     text += f"  Exclude: {len(targets.get('exclude', []))} IDs\n"
     if targets.get('exclude'):
         text += f"  Exclude IDs: {targets.get('exclude')[:5]}...\n"  # Show first 5 IDs
+    t = targets.get('types') or {}
+    if t:
+        text += f"  Types: private={t.get('private')} group={t.get('group')} supergroup={t.get('supergroup')} channel={t.get('channel')}\n"
     
     text += f"\n**Rate:** {cfg.get('rate_per_min', 'default')} msg/min\n"
     

@@ -29,6 +29,15 @@ def main_menu_kb(campaign_running: bool = False) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def analytics_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="🎯 Show Targets", callback_data="analytics:targets"),
+         InlineKeyboardButton(text="🔄 Refresh", callback_data="analytics:refresh")],
+        [InlineKeyboardButton(text="↩️ Back", callback_data="menu:home")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def back_to_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩️ Back", callback_data="menu:home")]])
 
@@ -38,13 +47,28 @@ def otp_keypad_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩️ Back", callback_data="menu:home")]])
 
 
-def targets_menu_kb() -> InlineKeyboardMarkup:
+def targets_menu_kb(types: dict | None = None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="📥 Only These IDs", callback_data="targets:include")],
         [InlineKeyboardButton(text="🌐 All Dialogs", callback_data="targets:all")],
         [InlineKeyboardButton(text="🚫 Exclude IDs", callback_data="targets:exclude")],
-        [InlineKeyboardButton(text="↩️ Back", callback_data="menu:home")],
     ]
+
+    if types is not None:
+        def onoff(v: bool) -> str:
+            return "✅" if v else "❌"
+        rows.extend([
+            [
+                InlineKeyboardButton(text=f"{onoff(types.get('private', True))} Personal", callback_data="targets:type:private"),
+                InlineKeyboardButton(text=f"{onoff(types.get('group', True))} Groups", callback_data="targets:type:group"),
+            ],
+            [
+                InlineKeyboardButton(text=f"{onoff(types.get('supergroup', True))} Supergroups", callback_data="targets:type:supergroup"),
+                InlineKeyboardButton(text=f"{onoff(types.get('channel', True))} Channels", callback_data="targets:type:channel"),
+            ],
+        ])
+
+    rows.append([InlineKeyboardButton(text="↩️ Back", callback_data="menu:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

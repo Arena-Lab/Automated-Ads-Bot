@@ -143,15 +143,6 @@ class LoginHandler:
                 
             except FloodWait as e:
                 await sending_msg.delete()
-                wait_min = e.value // 60
-                wait_sec = e.value % 60
-                await message.reply(
-                    f"<b>⏳ Rate Limited</b>\n\n"
-                    f"⚠️ <i>Too many login attempts detected</i>\n\n"
-                    f"⏰ <b>Wait Time:</b> {wait_min}m {wait_sec}s\n\n"
-                    f"🔒 <i>This is a Telegram security measure</i>",
-                    parse_mode=ParseMode.HTML
-                )
                 return False
                 
             except PhoneNumberInvalid:

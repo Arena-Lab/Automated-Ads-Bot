@@ -276,17 +276,6 @@ async def generate_session(_, message):
             await sending_otp_msg.delete()
         except Exception:
             pass
-            
-        # Calculate wait time in minutes and seconds
-        wait_min = e.value // 60
-        wait_sec = e.value % 60
-        await message.reply(
-            f"<b>⏳ Rate Limited</b>\n\n"
-            f"⚠️ <i>Too many login attempts detected</i>\n\n"
-            f"⏰ <b>Wait Time:</b> {wait_min}m {wait_sec}s\n\n"
-            f"🔒 <i>This is a Telegram security measure</i>",
-            parse_mode=ParseMode.HTML
-        )
         await client.disconnect()
         return
     except PhoneNumberInvalid:
