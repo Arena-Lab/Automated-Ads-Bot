@@ -4,7 +4,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from app.core.config import settings
 
 
-def main_menu_kb(campaign_running: bool = False) -> InlineKeyboardMarkup:
+def main_menu_kb(campaign_running: bool = False, is_admin: bool = False) -> InlineKeyboardMarkup:
     rows = [
         # Top row: Login and My Accounts buttons (2x2 format)
         [InlineKeyboardButton(text="🔑 Login", callback_data="menu:login"),
@@ -25,6 +25,25 @@ def main_menu_kb(campaign_running: bool = False) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="📜 Policy", callback_data="menu:policy"),
         ],
+    ]
+    if is_admin:
+        rows.append([InlineKeyboardButton(text="🛠️ Admin", callback_data="menu:admin")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_menu_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="⚙️ Diagnostics", callback_data="admin:diagnostics")],
+        [InlineKeyboardButton(text="🔁 Restart VPS", callback_data="admin:restart")],
+        [InlineKeyboardButton(text="↩️ Back", callback_data="menu:home")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def confirm_restart_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="✅ Confirm Restart", callback_data="admin:restart:confirm")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="admin:restart:cancel")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -72,12 +91,19 @@ def targets_menu_kb(types: dict | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def interval_menu_kb() -> InlineKeyboardMarkup:
+def interval_menu_kb(cycle_enabled: bool = False, rest_seconds: int | None = None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text=f"🛡️ Safe ({settings.INTERVAL_PRESETS_SAFE}/min)", callback_data="interval:safe")],
         [InlineKeyboardButton(text=f"⚖️ Default ({settings.INTERVAL_PRESETS_DEFAULT}/min)", callback_data="interval:default")],
         [InlineKeyboardButton(text=f"🔥 Aggressive ({settings.INTERVAL_PRESETS_AGGRESSIVE}/min)", callback_data="interval:aggressive")],
         [InlineKeyboardButton(text="✍️ Custom", callback_data="interval:custom")],
+        [InlineKeyboardButton(text=f"♻️ Auto Cycle: {'ON' if cycle_enabled else 'OFF'}", callback_data="interval:cycle_toggle")],
+        [
+            InlineKeyboardButton(text="⏱️ 30s", callback_data="interval:rest:30"),
+            InlineKeyboardButton(text="⏱️ 60s", callback_data="interval:rest:60"),
+            InlineKeyboardButton(text="⏱️ 300s", callback_data="interval:rest:300"),
+        ],
+        [InlineKeyboardButton(text="✍️ Custom Rest (s)", callback_data="interval:rest_custom")],
         [InlineKeyboardButton(text="↩️ Back", callback_data="menu:home")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)

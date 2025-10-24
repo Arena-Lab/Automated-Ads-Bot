@@ -1,7 +1,288 @@
 from __future__ import annotations
+
+async def menu_admin(cb: CallbackQuery):
+    if not _is_admin(cb.from_user.id):
+        await safe_answer_callback(cb)
+        return
+    text = (
+        "<b>Admin Panel</b>\n"
+        "• Diagnostics: runtime health and counts\n"
+        "• Gcast: reply to any message with /gcast to broadcast it\n"
+        "• Restart VPS: requires sudo permission\n"
+    )
+    try:
+        if getattr(cb.message, "photo", None):
+            await cb.message.edit_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=admin_menu_kb())
+        else:
+            await cb.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=admin_menu_kb())
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
+    await safe_answer_callback(cb)
+
+
+# ===== Admin Slash Commands (runtime diagnostics & control) =====
+
+async def admin_cmd_diagnostics(message: Message):
+    if not _is_admin(message.from_user.id):
+        return
+    db = get_db_sync()
+    # Mongo ping
+    mongo_ok = False
+    try:
+        ping = await db.command({"ping": 1})
+        mongo_ok = bool(ping.get("ok"))
+    except Exception:
+        mongo_ok = False
+    # Redis ping
+    redis_ok = False
+    try:
+        pong = await arq_pool.ping() if arq_pool else None
+        redis_ok = bool(pong)
+    except Exception:
+        redis_ok = False
+    users_n = await db.users.count_documents({})
+    accounts_n = await db.accounts.count_documents({})
+    camp_running = await db.campaigns.count_documents({"status": {"$in": ["running", "sleeping"]}})
+    camp_recent = await db.campaigns.count_documents({"created_at": {"$gte": datetime.now(timezone.utc) - timedelta(days=1)}})
+    text = (
+        f"<b>Diagnostics</b>\n"
+        f"Redis: {'✅' if redis_ok else '❌'} | Mongo: {'✅' if mongo_ok else '❌'}\n"
+        f"Users: {users_n} | Accounts: {accounts_n}\n"
+        f"Campaigns active: {camp_running} | New(24h): {camp_recent}"
+    )
+    await message.reply(text, parse_mode=ParseMode.HTML)
+
+
+async def admin_cmd_errors(message: Message):
+    if not _is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    limit = 20
+    if len(parts) >= 2 and parts[1].isdigit():
+        limit = max(1, min(100, int(parts[1])))
+    db = get_db_sync()
+    events = ["failed", "client_connect_fail", "discover_fail"]
+    cur = db.logs.find({"event": {"$in": events}}).sort("ts", -1).limit(limit)
+    rows = []
+    name_cache: dict[int, str] = {}
+    async def _user_disp(uid: int) -> str:
+        if uid in name_cache:
+            return name_cache[uid]
+        disp = str(uid)
+        try:
+            ch = await message.bot.get_chat(uid)
+            nm = " ".join(filter(None, [ch.first_name, ch.last_name])) or (ch.username or str(uid))
+            if ch.username:
+                disp = f"{nm} (@{ch.username})"
+            else:
+                disp = nm
+        except Exception:
+            disp = str(uid)
+        name_cache[uid] = disp
+        return disp
+    async for d in cur:
+        ts = d.get("ts")
+        t = ts.strftime("%H:%M:%S") if isinstance(ts, datetime) else "--:--:--"
+        owner = d.get("owner_user_id")
+        owner_disp = await _user_disp(owner) if owner is not None else "-"
+        ev = d.get("event")
+        cid = d.get("campaign_id", "-")
+        chat = d.get("chat_id", "-")
+        reason = d.get("fail_reason") or d.get("reason") or d.get("error") or "-"
+        rows.append(f"{t} • user={owner_disp} • ev={ev} • cid={cid} • chat={chat} • {reason}")
+    text = "<b>Recent Errors</b>\n" + ("\n".join(rows) if rows else "(none)")
+    await message.reply(text, parse_mode=ParseMode.HTML)
+
+
+async def admin_cmd_users(message: Message):
+    if not _is_admin(message.from_user.id):
+        return
+    db = get_db_sync()
+    users_n = await db.users.count_documents({})
+    accounts_n = await db.accounts.count_documents({})
+    active_camps = await db.campaigns.count_documents({"status": {"$in": ["running", "sleeping"]}})
+    # Top 20 most recently active users from logs
+    recent = []
+    name_cache: dict[int, str] = {}
+    async def _user_disp(uid: int) -> str:
+        if uid in name_cache:
+            return name_cache[uid]
+        disp = str(uid)
+        try:
+            ch = await message.bot.get_chat(uid)
+            nm = " ".join(filter(None, [ch.first_name, ch.last_name])) or (ch.username or str(uid))
+            if ch.username:
+                disp = f"{nm} (@{ch.username})"
+            else:
+                disp = nm
+        except Exception:
+            disp = str(uid)
+        name_cache[uid] = disp
+        return disp
+    try:
+        async for row in db.logs.aggregate([
+            {"$group": {"_id": "$owner_user_id", "last_ts": {"$max": "$ts"}}},
+            {"$sort": {"last_ts": -1}},
+            {"$limit": 20},
+        ]):
+            uid = row.get("_id")
+            ts = row.get("last_ts")
+            t = ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime) else "-"
+            disp = await _user_disp(uid) if uid is not None else "-"
+            recent.append(f"• {disp}: {t}")
+    except Exception:
+        pass
+    text = (
+        f"<b>Users & Accounts</b>\n"
+        f"Users: {users_n} | Accounts: {accounts_n} | Active campaigns: {active_camps}\n\n"
+        f"<b>Most recent activity</b>\n" + ("\n".join(recent) if recent else "(no activity)")
+    )
+    await message.reply(text, parse_mode=ParseMode.HTML)
+
+
+async def admin_cmd_activities(message: Message):
+    if not _is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    limit = 25
+    if len(parts) >= 2 and parts[1].isdigit():
+        limit = max(1, min(100, int(parts[1])))
+    db = get_db_sync()
+    cur = db.logs.find({}).sort("ts", -1).limit(limit)
+    rows = []
+    async for d in cur:
+        ts = d.get("ts")
+        t = ts.strftime("%H:%M:%S") if isinstance(ts, datetime) else "--:--:--"
+        owner = d.get("owner_user_id")
+        ev = d.get("event")
+        cid = d.get("campaign_id", "-")
+        chat = d.get("chat_id", "-")
+        extra = d.get("reason") or d.get("fail_reason") or d.get("error") or (f"sec={d.get('seconds')}" if d.get('seconds') else "")
+        rows.append(f"{t} • owner={owner} • ev={ev} • cid={cid} • chat={chat} {('• ' + extra) if extra else ''}")
+    text = "<b>Recent Activities</b>\n" + ("\n".join(rows) if rows else "(none)")
+    await message.reply(text, parse_mode=ParseMode.HTML)
+
+
+async def admin_cmd_gcast(message: Message):
+    if not _is_admin(message.from_user.id):
+        return
+    db = get_db_sync()
+    # If /gcast is sent as a reply to some message, broadcast that replied message immediately
+    if getattr(message, "reply_to_message", None):
+        src = message.reply_to_message
+        sent = 0
+        failed = 0
+        cursor = db.users.find({"blocked": {"$ne": True}}, projection={"user_id": 1})
+        async for doc in cursor:
+            uid = doc.get("user_id")
+            if not uid:
+                continue
+            try:
+                await message.bot.copy_message(chat_id=uid, from_chat_id=src.chat.id, message_id=src.message_id, reply_markup=src.reply_markup)
+                sent += 1
+            except Exception:
+                failed += 1
+            await asyncio.sleep(0.05)
+        await message.reply(f"📢 Gcast complete. Sent: {sent}, Failed: {failed}")
+        return
+    # Otherwise, do NOT start any mode; just instruct how to use it
+    await message.reply(
+        "<b>How to use /gcast</b>\n"
+        "Reply to the message (text/media/post) that you want to broadcast, and send /gcast.\n"
+        "The bot will copy that message to all users preserving formatting, captions, and buttons.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def admin_diagnostics(cb: CallbackQuery):
+    if not _is_admin(cb.from_user.id):
+        await safe_answer_callback(cb)
+        return
+    db = get_db_sync()
+    # DB ping
+    mongo_ok = False
+    try:
+        ping = await db.command({"ping": 1})
+        mongo_ok = bool(ping.get("ok"))
+    except Exception:
+        mongo_ok = False
+    # Redis ping
+    redis_ok = False
+    try:
+        pong = await arq_pool.ping() if arq_pool else None
+        redis_ok = bool(pong)
+    except Exception:
+        redis_ok = False
+    # Counts
+    users_n = await db.users.count_documents({})
+    accounts_n = await db.accounts.count_documents({})
+    camp_running = await db.campaigns.count_documents({"status": {"$in": ["running", "sleeping"]}})
+    camp_recent = await db.campaigns.count_documents({"created_at": {"$gte": datetime.now(timezone.utc) - timedelta(days=1)}})
+    text = (
+        f"<b>Diagnostics</b>\n"
+        f"Redis: {'✅' if redis_ok else '❌'} | Mongo: {'✅' if mongo_ok else '❌'}\n"
+        f"Users: {users_n} | Accounts: {accounts_n}\n"
+        f"Campaigns active: {camp_running} | New(24h): {camp_recent}\n"
+        f"Bot: @{(await cb.message.bot.get_me()).username}\n"
+    )
+    try:
+        if getattr(cb.message, "photo", None):
+            await cb.message.edit_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=admin_menu_kb())
+        else:
+            await cb.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=admin_menu_kb())
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
+    await safe_answer_callback(cb)
+
+
+async def admin_restart(cb: CallbackQuery):
+    if not _is_admin(cb.from_user.id):
+        await safe_answer_callback(cb)
+        return
+    db = get_db_sync()
+    await db.users.update_one({"user_id": cb.from_user.id}, {"$set": {"state": "await_restart_password"}}, upsert=True)
+    txt = (
+        "<b>Restart VPS</b>\n"
+        "Send your sudo password now to proceed.\n"
+        "This will run sudo reboot."
+    )
+    try:
+        if getattr(cb.message, "photo", None):
+            await cb.message.edit_caption(caption=txt, parse_mode=ParseMode.HTML, reply_markup=back_to_menu_kb())
+        else:
+            await cb.message.edit_text(txt, parse_mode=ParseMode.HTML, reply_markup=back_to_menu_kb())
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
+    await safe_answer_callback(cb)
+
+
+async def admin_restart_confirm(cb: CallbackQuery):
+    if not _is_admin(cb.from_user.id):
+        await safe_answer_callback(cb)
+        return
+    # Try a non-interactive reboot
+    try:
+        subprocess.Popen(["sudo", "-n", "reboot"])  # fire-and-forget
+        await safe_answer_callback(cb, "Reboot command issued.")
+    except Exception as e:
+        await safe_answer_callback(cb, f"Failed: {e}", show_alert=True)
+
+
+async def admin_restart_cancel(cb: CallbackQuery):
+    if not _is_admin(cb.from_user.id):
+        await safe_answer_callback(cb)
+        return
+    await menu_admin(cb)
+
+
+#! removed admin_gcast callback; Gcast is reply-only via /gcast
+ 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import os
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InputMediaPhoto
@@ -15,12 +296,14 @@ from app.core.session_manager import session_manager
 from app.core.telegram_login import telegram_login_manager
 from .keyboards import (
     main_menu_kb, back_to_menu_kb, targets_menu_kb, interval_menu_kb,
-    login_menu_kb, accounts_menu_kb, account_detail_kb, analytics_kb
+    login_menu_kb, accounts_menu_kb, account_detail_kb, analytics_kb,
+    admin_menu_kb, confirm_restart_kb
 )
 from arq import create_pool
 from arq.connections import RedisSettings
 from urllib.parse import urlparse
 import ssl as _ssl
+import subprocess
 from bson import ObjectId
 
 
@@ -120,18 +403,19 @@ async def on_startup(bot: Bot):
 
 
 async def start_handler(message: Message, bot: Bot):
+    admin_flag = _is_admin(message.from_user.id)
     if settings.START_MEDIA_URL:
         try:
             await message.answer_photo(
                 photo=settings.START_MEDIA_URL,
                 caption=hero_caption(),
                 parse_mode=ParseMode.HTML,
-                reply_markup=main_menu_kb(campaign_running=False),
+                reply_markup=main_menu_kb(campaign_running=False, is_admin=admin_flag),
             )
             return
         except Exception as e:
             logger.warning("Failed to send start media: %s", e)
-    await message.answer(hero_caption(), parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(campaign_running=False))
+    await message.answer(hero_caption(), parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(campaign_running=False, is_admin=admin_flag))
 
 
 async def menu_home(cb: CallbackQuery):
@@ -146,7 +430,7 @@ async def menu_home(cb: CallbackQuery):
         try:
             oid = ObjectId(active_id)
             campaign = await db.campaigns.find_one({"_id": oid})
-            if campaign and campaign.get("status") == "running":
+            if campaign and campaign.get("status") in {"running", "sleeping"}:
                 campaign_running = True
             else:
                 # Clean up stale campaign ID
@@ -171,12 +455,12 @@ async def menu_home(cb: CallbackQuery):
             try:
                 await cb.message.edit_media(
                     InputMediaPhoto(media=settings.START_MEDIA_URL, caption=caption, parse_mode=ParseMode.HTML),
-                    reply_markup=main_menu_kb(campaign_running),
+                    reply_markup=main_menu_kb(campaign_running, is_admin=_is_admin(cb.from_user.id)),
                 )
             except Exception:
-                await cb.message.edit_caption(caption=caption, parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(campaign_running))
+                await cb.message.edit_caption(caption=caption, parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(campaign_running, is_admin=_is_admin(cb.from_user.id)))
         else:
-            await cb.message.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(campaign_running))
+            await cb.message.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(campaign_running, is_admin=_is_admin(cb.from_user.id)))
     except TelegramBadRequest as e:
         if "message is not modified" in str(e):
             # Message content is identical, just answer the callback
@@ -319,15 +603,71 @@ async def menu_view_msg(cb: CallbackQuery):
 
 async def menu_interval(cb: CallbackQuery):
     presets = await get_presets()
+    db = get_db_sync()
+    user = await db.users.find_one({"user_id": cb.from_user.id})
+    cfg = (user or {}).get("config", {})
+    repeat = cfg.get("repeat", {}) or {}
+    cycle_enabled = bool(repeat.get("enabled", False))
+    rest_seconds = int(repeat.get("rest_seconds", 60))
     text = (
         "<b>Intervals</b>\n"
-        f"Safe: {presets['safe']}/min, Default: {presets['default']}/min, Aggressive: {presets['aggressive']}/min.\n\n"
+        f"Safe: {presets['safe']}/min, Default: {presets['default']}/min, Aggressive: {presets['aggressive']}/min.\n"
+        f"Cycle: {'ON' if cycle_enabled else 'OFF'} | Rest: {rest_seconds}s\n\n"
         "Pick a preset or set custom."
     )
-    if cb.message.photo:
-        await cb.message.edit_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=interval_menu_kb())
-    else:
-        await cb.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=interval_menu_kb())
+    try:
+        if getattr(cb.message, "photo", None):
+            try:
+                await cb.message.edit_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=interval_menu_kb(cycle_enabled=cycle_enabled, rest_seconds=rest_seconds))
+            except TelegramBadRequest as e:
+                se = str(e)
+                if "there is no caption" in se or "message is not modified" in se:
+                    try:
+                        await cb.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=interval_menu_kb(cycle_enabled=cycle_enabled, rest_seconds=rest_seconds))
+                    except TelegramBadRequest as e2:
+                        if "message is not modified" not in str(e2):
+                            raise
+                else:
+                    raise
+        else:
+            try:
+                await cb.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=interval_menu_kb(cycle_enabled=cycle_enabled, rest_seconds=rest_seconds))
+            except TelegramBadRequest as e:
+                if "message is not modified" not in str(e):
+                    raise
+    finally:
+        await safe_answer_callback(cb)
+
+
+async def interval_cycle_toggle(cb: CallbackQuery):
+    db = get_db_sync()
+    user = await db.users.find_one({"user_id": cb.from_user.id})
+    cfg = (user or {}).get("config", {})
+    repeat = cfg.get("repeat", {}) or {}
+    enabled = bool(repeat.get("enabled", False))
+    repeat["enabled"] = not enabled
+    await db.users.update_one({"user_id": cb.from_user.id}, {"$set": {"config.repeat": repeat}}, upsert=True)
+    await menu_interval(cb)
+
+
+async def interval_rest_preset(cb: CallbackQuery):
+    try:
+        sec = int(cb.data.split(":")[-1])
+    except Exception:
+        sec = 60
+    db = get_db_sync()
+    await db.users.update_one({"user_id": cb.from_user.id}, {"$set": {"config.repeat.rest_seconds": int(sec)}}, upsert=True)
+    await menu_interval(cb)
+
+
+async def interval_rest_custom(cb: CallbackQuery):
+    db = get_db_sync()
+    await db.users.update_one({"user_id": cb.from_user.id}, {"$set": {"state": "await_custom_rest"}}, upsert=True)
+    txt = "<b>Custom Rest</b>\nSend rest delay in seconds between cycles."
+    try:
+        await cb.message.edit_caption(caption=txt, parse_mode=ParseMode.HTML, reply_markup=back_to_menu_kb())
+    except Exception:
+        await cb.message.edit_text(txt, parse_mode=ParseMode.HTML, reply_markup=back_to_menu_kb())
     await safe_answer_callback(cb)
 
 
@@ -388,7 +728,7 @@ async def menu_start(cb: CallbackQuery):
         try:
             oid = ObjectId(active_id)
             campaign = await db.campaigns.find_one({"_id": oid})
-            if campaign and campaign.get("status") == "running":
+            if campaign and campaign.get("status") in {"running", "sleeping"}:
                 campaign_running = True
             else:
                 # Clean up stale campaign ID
@@ -408,6 +748,9 @@ async def menu_start(cb: CallbackQuery):
     targets_cfg = cfg.get("targets", {})
     presets = await get_presets()
     rate = int(cfg.get("rate_per_min", presets["default"]))
+    repeat_cfg = cfg.get("repeat", {}) or {}
+    repeat_enabled = bool(repeat_cfg.get("enabled", False))
+    repeat_rest_seconds = int(repeat_cfg.get("rest_seconds", 60))
     
     # COMPREHENSIVE VALIDATION
     validation_errors = []
@@ -454,6 +797,8 @@ async def menu_start(cb: CallbackQuery):
         "mode": mode,
         "rate_per_min": rate,
         "types": types_cfg,
+        "repeat_enabled": repeat_enabled,
+        "repeat_rest_seconds": repeat_rest_seconds,
         "status": "running",
         "created_at": datetime.now(timezone.utc),
     }
@@ -504,6 +849,7 @@ async def menu_start(cb: CallbackQuery):
         f"⚡ <b>Rate:</b> {rate}/min per account\n"
         f"👥 <b>Accounts:</b> {account_count}\n"
         f"🆔 <b>Campaign ID:</b> {cid}\n\n"
+        f"♻️ <b>Cycle:</b> {'ON' if repeat_enabled else 'OFF'} | ⏱️ <b>Rest:</b> {repeat_rest_seconds}s\n"
         f"📌 <b>Targets Mode:</b> {mode.upper()}\n"
         f"🔖 <b>Types:</b> {types_line}\n"
         f"📇 <b>Include:</b> {include_count if mode == 'include' else 'All Dialogs'}\n"
@@ -516,9 +862,9 @@ async def menu_start(cb: CallbackQuery):
     
     try:
         if cb.message.photo:
-            await cb.message.edit_caption(caption=updated_text, parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(campaign_running=True))
+            await cb.message.edit_caption(caption=updated_text, parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(campaign_running=True, is_admin=_is_admin(cb.from_user.id)))
         else:
-            await cb.message.edit_text(updated_text, parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(campaign_running=True))
+            await cb.message.edit_text(updated_text, parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(campaign_running=True, is_admin=_is_admin(cb.from_user.id)))
     except TelegramBadRequest as e:
         if "message is not modified" not in str(e):
             raise e
@@ -549,9 +895,9 @@ async def menu_stop(cb: CallbackQuery):
     # Update the main menu back to normal state
     try:
         if cb.message.photo:
-            await cb.message.edit_caption(caption=hero_caption(), parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(campaign_running=False))
+            await cb.message.edit_caption(caption=hero_caption(), parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(campaign_running=False, is_admin=_is_admin(cb.from_user.id)))
         else:
-            await cb.message.edit_text(hero_caption(), parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(campaign_running=False))
+            await cb.message.edit_text(hero_caption(), parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(campaign_running=False, is_admin=_is_admin(cb.from_user.id)))
     except TelegramBadRequest as e:
         if "message is not modified" not in str(e):
             raise e
@@ -1109,6 +1455,52 @@ async def content_message_handler(message: Message):
             await success_msg.delete()
         except Exception:
             pass
+    elif state == "await_custom_rest":
+        try:
+            sec = int(message.text.strip())
+            if sec <= 0:
+                raise ValueError
+        except Exception:
+            await message.reply("Send a positive integer (seconds).")
+            return
+        await db.users.update_one({"user_id": message.from_user.id}, {"$set": {"config.repeat.rest_seconds": sec}, "$unset": {"state": 1}}, upsert=True)
+        success_msg = await message.reply(f"✅ Custom rest set to {sec}s successfully!")
+        await asyncio.sleep(2)
+        try:
+            await message.delete()
+            await success_msg.delete()
+        except Exception:
+            pass
+    
+    elif state == "await_restart_password":
+        pwd = (message.text or "").strip()
+        await db.users.update_one({"user_id": message.from_user.id}, {"$unset": {"state": 1}})
+        if not _is_admin(message.from_user.id):
+            return
+        if not pwd:
+            await message.reply("Password cannot be empty.")
+            return
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                'sudo', '-S', '-p', '', 'reboot',
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(input=(pwd + "\n").encode()), timeout=1.5)
+                rc = proc.returncode
+            except asyncio.TimeoutError:
+                rc = None
+                out, err = b"", b""
+            if rc is not None and rc != 0:
+                emsg = (err or b"").decode(errors='ignore').strip() or "sudo failed"
+                await message.reply(f"❌ Reboot failed: {emsg}")
+            else:
+                await message.reply("🔁 Rebooting now... The bot will go offline shortly.")
+        except Exception as e:
+            await message.reply(f"❌ Error: {e}")
+
     elif state == "await_phone_number":
         phone_number = message.text.strip()
         # Basic phone validation
@@ -1298,8 +1690,13 @@ async def main():
     dp.message.register(admin_testdialogs, Command("testdialogs"))
     dp.message.register(admin_testsend, Command("testsend"))
     dp.message.register(admin_campaign, Command("campaign"))
-    # Content/config handlers
-    dp.message.register(content_message_handler, F.text)
+    # New diagnostics/control commands
+    dp.message.register(admin_cmd_diagnostics, Command("diagnostics"))
+    dp.message.register(admin_cmd_errors, Command("errors"))
+    dp.message.register(admin_cmd_users, Command("users"))
+    dp.message.register(admin_cmd_activities, Command("activities"))
+    dp.message.register(admin_cmd_gcast, Command("gcast"))
+    # Content/config handlers (catch-all registered later)
     dp.callback_query.register(menu_home, F.data == "menu:home")
     
     # Login and accounts handlers
@@ -1323,6 +1720,14 @@ async def main():
     dp.callback_query.register(menu_interval, F.data == "menu:interval")
     dp.callback_query.register(interval_preset, F.data.in_({"interval:safe", "interval:default", "interval:aggressive"}))
     dp.callback_query.register(interval_custom, F.data == "interval:custom")
+    dp.callback_query.register(interval_cycle_toggle, F.data == "interval:cycle_toggle")
+    dp.callback_query.register(interval_rest_preset, F.data.startswith("interval:rest:"))
+    dp.callback_query.register(interval_rest_custom, F.data == "interval:rest_custom")
+    dp.callback_query.register(menu_admin, F.data == "menu:admin")
+    dp.callback_query.register(admin_diagnostics, F.data == "admin:diagnostics")
+    dp.callback_query.register(admin_restart, F.data == "admin:restart")
+    dp.callback_query.register(admin_restart_confirm, F.data == "admin:restart:confirm")
+    dp.callback_query.register(admin_restart_cancel, F.data == "admin:restart:cancel")
     dp.callback_query.register(menu_start, F.data == "menu:start")
     dp.callback_query.register(menu_stop, F.data == "menu:stop")
     dp.callback_query.register(menu_analytics, F.data == "menu:analytics")
@@ -1330,6 +1735,9 @@ async def main():
     dp.callback_query.register(analytics_targets, F.data == "analytics:targets")
     dp.callback_query.register(menu_autoreply, F.data == "menu:autoreply")
     dp.callback_query.register(menu_policy, F.data == "menu:policy")
+
+    # Catch-all at the end so states like await_gcast_payload accept any content (photos, videos, forwards, etc.)
+    dp.message.register(content_message_handler)
 
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 

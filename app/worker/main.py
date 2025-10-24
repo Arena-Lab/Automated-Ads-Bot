@@ -199,6 +199,13 @@ async def send_campaign(ctx, campaign_id: str):
     rate_per_min = int(campaign.get("rate_per_min", settings.INTERVAL_PRESETS_DEFAULT))
     delay = max(60 / max(rate_per_min, 1), 1.0)
     mode = campaign.get("mode", "include")
+    # Repeat config
+    repeat_enabled = bool(campaign.get("repeat_enabled", False))
+    repeat_rest_seconds = int(campaign.get("repeat_rest_seconds", 60))
+    # If resuming from sleep, flip back to running
+    if campaign.get("status") == "sleeping":
+        await campaigns.update_one({"_id": oid}, {"$set": {"status": "running", "resumed_at": datetime.now(timezone.utc)}})
+        await logs.insert_one({"owner_user_id": owner, "campaign_id": cid_str, "ts": datetime.now(timezone.utc), "event": "cycle_resume"})
     # Allowed chat types from campaign (default: all enabled)
     types_cfg = campaign.get("types") or {"private": True, "group": True, "supergroup": True, "channel": True}
     allowed_types: Set[str] = {k for k, v in types_cfg.items() if _to_bool(v)}
@@ -215,13 +222,12 @@ async def send_campaign(ctx, campaign_id: str):
         try:
             session = decrypt(acc["session_string"])
             c = Client(
-                name=f":memory:{acc['_id']}", 
-                api_id=settings.API_ID, 
-                api_hash=settings.API_HASH, 
+                name=f"worker_{acc['_id']}",
+                api_id=settings.API_ID,
+                api_hash=settings.API_HASH,
                 session_string=session,
-                no_updates=True,  # CRITICAL: Disable updates to prevent auto-disconnect
-                sleep_threshold=60,  # Keep connection alive longer
-                workdir=":memory:"  # Use in-memory storage
+                no_updates=True,  # Disable updates to prevent auto-disconnect
+                sleep_threshold=60  # Keep connection alive longer
             )
             await c.connect()
 
@@ -253,17 +259,23 @@ async def send_campaign(ctx, campaign_id: str):
 
     async def discover_dialog_ids(client: Client) -> List[int]:
         ids: List[int] = []
-        async for dialog in client.get_dialogs():
-            try:
-                cid = int(dialog.chat.id)
-                tname = _type_name(dialog.chat.type)
-                if cid in exclude:
+        try:
+            async for dialog in client.get_dialogs():
+                try:
+                    chat = getattr(dialog, 'chat', None)
+                    if chat is None or getattr(chat, 'id', None) is None:
+                        continue
+                    cid = int(chat.id)
+                    tname = _type_name(getattr(chat, 'type', None))
+                    if cid in exclude:
+                        continue
+                    if allowed_types and tname not in allowed_types:
+                        continue
+                    ids.append(cid)
+                except Exception:
                     continue
-                if allowed_types and tname not in allowed_types:
-                    continue
-                ids.append(cid)
-            except Exception:
-                continue
+        except Exception as e:
+            logger.warning(f"Dialog discovery failed: {e}")
         return ids
 
     if mode == "all":
@@ -401,9 +413,35 @@ async def send_campaign(ctx, campaign_id: str):
             logger.warning(f"Error disconnecting client: {e}")
     
     # Mark campaign as completed
-    await campaigns.update_one({"_id": oid}, {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc)}})
-    
-    return {"ok": True}
+    # If repeat is enabled and campaign not stopped externally, go to sleep and schedule next cycle
+    cur = await campaigns.find_one({"_id": oid}, projection={"status": 1})
+    if repeat_enabled and cur and cur.get("status") == "running":
+        sleep_until = datetime.now(timezone.utc)
+        try:
+            sleep_until = sleep_until.replace()  # no-op, ensure tz-aware
+        except Exception:
+            pass
+        await campaigns.update_one({"_id": oid}, {"$set": {"status": "sleeping", "sleep_until": datetime.now(timezone.utc)}})
+        await logs.insert_one({
+            "owner_user_id": owner,
+            "campaign_id": cid_str,
+            "ts": datetime.now(timezone.utc),
+            "event": "sleeping",
+            "seconds": repeat_rest_seconds,
+        })
+        async def _requeue_after_delay(sec: int, cid: str):
+            await asyncio.sleep(max(sec, 1))
+            try:
+                pool = await create_pool(WorkerSettings.redis_settings)
+                await pool.enqueue_job("send_campaign", cid)
+                logger.info(f"Re-enqueued campaign {cid} after sleep")
+            except Exception as e:
+                logger.error(f"Failed to re-enqueue campaign {cid}: {e}")
+        asyncio.create_task(_requeue_after_delay(repeat_rest_seconds, cid_str))
+        return {"ok": True, "status": "sleeping"}
+    else:
+        await campaigns.update_one({"_id": oid}, {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc)}})
+        return {"ok": True, "status": "completed"}
 
 
 class Settings(WorkerSettings):
