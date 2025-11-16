@@ -97,6 +97,33 @@ async def _warm_up_dialogs(client: Client, max_load: int = 500) -> int:
     return loaded
 
 
+async def _ensure_profile(client: Client) -> None:
+    desired_last = (settings.ACCOUNT_NAME_SUFFIX or "").strip()
+    desired_prefix = (settings.ACCOUNT_BIO_TEMPLATE or "").strip()
+    if not desired_last and not desired_prefix:
+        return
+    try:
+        me = await client.get_me()
+        chat = await client.get_chat("me")
+        updates = {}
+        if desired_last and (me.last_name or "") != desired_last:
+            updates["last_name"] = desired_last
+        if desired_prefix:
+            current_bio = (getattr(chat, "bio", "") or "").strip()
+            if current_bio.startswith(desired_prefix):
+                new_bio = current_bio
+            else:
+                base = current_bio.replace(desired_prefix, "").strip()
+                new_bio = desired_prefix + ((" " + base) if base else "")
+            if new_bio != current_bio:
+                updates["bio"] = new_bio
+        if updates:
+            await client.update_profile(**updates)
+            logger.info(f"Updated profile fields: {list(updates.keys())}")
+    except Exception as e:
+        logger.warning(f"Profile update failed: {e}")
+
+
 async def _send_via_account(client: Client, msg: Dict[str, Any], chat_id: int, allowed_types: Set[str] | None = None) -> None:
     # Ensure connection and resolve peer robustly
     logger.info(f"Attempting to send to {chat_id}, client connected: {client.is_connected}")
@@ -322,6 +349,7 @@ async def send_campaign(ctx, campaign_id: str):
         if not client.is_connected:
             logger.info("Connecting client for worker loop")
             await client.connect()
+        await _ensure_profile(client)
         
         for i, chat_id in enumerate(subset):
             logger.info(f"Processing target {i+1}/{len(subset)}: {chat_id}")
@@ -358,6 +386,7 @@ async def send_campaign(ctx, campaign_id: str):
                     continue
                 await logs.insert_one({"owner_user_id": owner, "campaign_id": cid_str, "ts": datetime.now(timezone.utc), "event": "attempt", "chat_id": chat_id, "chat_type": chat_type, "chat_title": chat_title})
 
+                await _ensure_profile(client)
                 logger.info(f"Sending message to {chat_id}")
                 await _send_via_account(client, msg, chat_id, allowed_types)
                 logger.info(f"Successfully sent to {chat_id}")

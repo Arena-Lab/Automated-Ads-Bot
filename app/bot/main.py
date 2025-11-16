@@ -299,6 +299,7 @@ from .keyboards import (
     login_menu_kb, accounts_menu_kb, account_detail_kb, analytics_kb,
     admin_menu_kb, confirm_restart_kb
 )
+from .force_sub import ForceSubMiddleware, force_sub_check
 from arq import create_pool
 from arq.connections import RedisSettings
 from urllib.parse import urlparse
@@ -1678,6 +1679,9 @@ async def main():
 
     dp.startup.register(on_startup)
 
+    dp.message.middleware(ForceSubMiddleware())
+    dp.callback_query.middleware(ForceSubMiddleware())
+
     dp.message.register(start_handler, CommandStart())
     # Admin commands
     dp.message.register(admin_setmax, Command("setmax"))
@@ -1697,6 +1701,8 @@ async def main():
     dp.message.register(admin_cmd_activities, Command("activities"))
     dp.message.register(admin_cmd_gcast, Command("gcast"))
     # Content/config handlers (catch-all registered later)
+    dp.callback_query.register(force_sub_check, F.data == "force_sub:check")
+
     dp.callback_query.register(menu_home, F.data == "menu:home")
     
     # Login and accounts handlers
